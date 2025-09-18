@@ -90,22 +90,42 @@ async function parseBody(req) {
 // ===== HMAC (amo → X-Signature) =====
 // стало:
 async function verifyAmoSignature(rawBody, headerSignature) {
-  if (!SECRET_TOKEN) return true;
+  if (!SECRET_TOKEN) return { ok: true, reason: 'no_secret' };
+
   try {
     const { createHmac } = await import('node:crypto');
 
-    // нормализуем данные
     const rawStr = typeof rawBody === 'string' ? rawBody : String(rawBody ?? '');
     const data =
       typeof Buffer !== 'undefined'
         ? Buffer.from(rawStr, 'utf8')
         : new TextEncoder().encode(rawStr);
 
-    const digest = createHmac('sha1', SECRET_TOKEN).update(data).digest('hex');
-    return (headerSignature || '').toLowerCase() === digest.toLowerCase();
+    const hmac = createHmac('sha1', SECRET_TOKEN).update(data);
+    const hex = hmac.digest('hex');
+    // чтобы не пересчитывать второй раз, создадим новый HMAC:
+    const hmac2 = createHmac('sha1', SECRET_TOKEN).update(data);
+    const b64 = hmac2.digest('base64');
+
+    const sig = (headerSignature || '').trim();
+
+    const match =
+      sig.toLowerCase() === hex.toLowerCase() ||
+      sig === b64; // base64 чувствителен к регистру
+
+    if (!match) {
+      // Диагностика: первые символы, чтобы не светить всё в логах
+      const short = (s) => (s ? s.slice(0, 16) + '…' + s.slice(-8) : '');
+      log('error', 'Invalid HMAC signature', {
+        got_header: short(sig),
+        want_hex: short(hex),
+        want_b64: short(b64),
+      });
+    }
+    return { ok: match, hex, b64 };
   } catch (e) {
     log('warn', 'Cannot verify HMAC (crypto error):', e?.message || e);
-    return false;
+    return { ok: false, reason: 'crypto_error' };
   }
 }
 
@@ -284,8 +304,24 @@ export default async function handler(req, res) {
     if (req.method !== 'POST') return res.status(405).end();
 
     // читаем raw тело для HMAC
+    // читаем сырое тело ДО парсинга
     const ctype = getHeader(req, 'content-type') || '';
     const rawBody = await readRawBody(req);
+
+    const xSig = getHeader(req, 'x-signature') || getHeader(req, 'X-Signature'); // на всякий
+    const check = await verifyAmoSignature(rawBody, xSig);
+
+    log('info', 'SIG-CONTEXT', {
+      ctype,
+      len: rawBody?.length || 0,
+      headSig: xSig ? (xSig.slice(0, 16) + '…') : null,
+      sample: (rawBody || '').slice(0, 200) // первые 200 символов тела
+    });
+
+    if (!check.ok) {
+      // Возвращаем 200, чтобы amo не дёргал ретраи, но помечаем ошибку
+      return res.status(200).json({ ok: false, error: 'invalid_signature' });
+    }
 
     // подпись (если SECRET_TOKEN задан)
     const xSig = getHeader(req, 'x-signature');
