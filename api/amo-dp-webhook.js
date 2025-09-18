@@ -233,8 +233,11 @@ export default async function handler(req, res) {
       headSig: headerSignature ? (headerSignature.slice(0,16) + '…') : null,
       sample: (rawBody || '').slice(0, 200),
     });
-
-    if (!sigCheck.ok) {
+    // Если заголовка нет — пропускаем с предупреждением.
+// Иначе — применяем строгую проверку.
+    if (!headerSignature) {
+      log('warn', 'X-Signature header is missing — accepting event without HMAC (check amo settings).');
+    } else if (!sigCheck.ok) {
       return res.status(200).json({ ok: false, error: 'invalid_signature' });
     }
 
