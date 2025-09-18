@@ -1,69 +1,71 @@
 // api/amo-dp-webhook.js
-// Vercel (Node runtime) — amoCRM Digital Pipeline webhook → Telegram
-// Универсальная работа с заголовками/телом (Node/Edge safe) + автообновление токена + HMAC-подпись
+// amoCRM → Webhook → Vercel (Node runtime). Без require, с raw-body, HMAC (hex|base64), авто-рефреш токена.
 
-// ===== ENV =====
 const {
-  // amoCRM auth/config
+  // amoCRM OAuth
   AMO_CLIENT_ID,
   AMO_CLIENT_SECRET,
   AMO_REDIRECT_URI,
 
-  AMO_REFRESH_TOKEN: ENV_REFRESH,
-  AMO_ACCESS_TOKEN: ENV_ACCESS, // опционально (ускоряет холодный старт)
-
   // домены
-  AMO_SUBDOMAIN,                // напр.: "new1754065789" (короткое имя без .amocrm.ru)
-  AMO_API_DOMAIN,               // напр.: "new1754065789.amocrm.ru" (если не задан — соберём из SUBDOMAIN)
+  AMO_SUBDOMAIN,                 // напр.: "new1754065789" (без .amocrm.ru)
+  AMO_API_DOMAIN,                // напр.: "new1754065789.amocrm.ru" (если не задан — соберём из SUBDOMAIN)
 
-  // подпись вебхуков
-  SECRET_TOKEN,                 // лучше использовать тот же secret из интеграции (client_secret)
+  // стартовые токены
+  AMO_ACCESS_TOKEN: ENV_ACCESS,
+  AMO_REFRESH_TOKEN: ENV_REFRESH,
+
+  // вебхук-подпись (секрет интеграции)
+  SECRET_TOKEN,                  // = секретный ключ интеграции (можно равен client_secret)
 
   // Telegram
-  TELEGRAM_BOT_TOKEN,
-  TELEGRAM_CHAT_ID,
-  TG_BOT_TOKEN,                 // запасные имена
-  TG_CHAT_ID,
+  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
+  TG_BOT_TOKEN, TG_CHAT_ID,
 
-  // кастомные поля сделки (можно переопределить через ENV)
+  // Кастомные поля сделки (ID можно переопределить через ENV)
   FIELD_DOOR_TYPE_ID = '2094731',
   FIELD_CITY_ID      = '2094733',
 } = process.env;
 
-// ===== RUNTIME STATE (в памяти инстанса) =====
+// ——— state (в памяти функции)
 let cachedAccessToken  = ENV_ACCESS  || '';
 let cachedRefreshToken = ENV_REFRESH || '';
 
 const BOT_TOKEN = TELEGRAM_BOT_TOKEN || TG_BOT_TOKEN;
 const CHAT_ID   = TELEGRAM_CHAT_ID   || TG_CHAT_ID;
 
-const VERSION = 'amo-dp-webhook v1.1.0 (node-edge safe + HMAC)';
+const VERSION = 'amo-dp-webhook v1.2.0';
 
+// ---------- helpers: лог, сабдомен/домен ----------
 function log(level, ...args) {
-  // level: 'info' | 'warn' | 'error'
   console[level]('[amo-dp]', ...args);
 }
-
-// ===== Utilities: headers/raw body (Node/Edge-safe) =====
-function getHeader(req, name) {
-  const n = String(name).toLowerCase();
-  // Edge Request: Headers-like (get)
-  if (req?.headers && typeof req.headers.get === 'function') {
-    return req.headers.get(n) || '';
-  }
-  // Node: plain object
-  if (req?.headers && typeof req.headers === 'object') {
-    return req.headers[n] || '';
-  }
-  return '';
+function uiSubdomain() {
+  // нормализуем короткое имя
+  const s = (AMO_SUBDOMAIN || '').replace(/\.amocrm\.ru$/i, '');
+  if (s) return s;
+  const fromApi = (AMO_API_DOMAIN || '').replace(/\.amocrm\.ru$/i, '');
+  return fromApi || 'api-b'; // fallback (лучше явно задать AMO_API_DOMAIN)
+}
+function domainHost() {
+  return (AMO_API_DOMAIN && AMO_API_DOMAIN.trim())
+    ? AMO_API_DOMAIN.trim()
+    : `${uiSubdomain()}.amocrm.ru`;
+}
+function leadUrl(leadId) {
+  return `https://${uiSubdomain()}.amocrm.ru/leads/detail/${leadId}`;
 }
 
+// ---------- headers & raw body (Node/Edge-safe) ----------
+function getHeader(req, name) {
+  const n = String(name).toLowerCase();
+  if (req?.headers && typeof req.headers.get === 'function') return req.headers.get(n) || '';
+  if (req?.headers && typeof req.headers === 'object') return req.headers[n] || '';
+  return '';
+}
 async function readRawBody(req) {
-  // Edge: есть req.text()
-  if (typeof req?.text === 'function') {
-    return await req.text();
-  }
-  // Node: IncomingMessage — собираем чанки
+  if (typeof req?.text === 'function') return await req.text(); // Edge
+  // Node IncomingMessage stream:
   return await new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
@@ -71,69 +73,44 @@ async function readRawBody(req) {
     req.on('error', reject);
   });
 }
-
-async function parseBody(req) {
-  const ctype = getHeader(req, 'content-type') || '';
-  const raw = await readRawBody(req);
-
-  if (ctype.includes('application/json')) {
-    try { return JSON.parse(raw || '{}'); } catch { return {}; }
-  }
-
-  // amo часто шлёт form-urlencoded
-  const params = new URLSearchParams(raw || '');
-  const obj = Object.create(null);
-  for (const [k, v] of params.entries()) obj[k] = v;
-  return obj;
+function parseUrlEncoded(str) {
+  const params = new URLSearchParams(str || '');
+  const o = Object.create(null);
+  for (const [k, v] of params.entries()) o[k] = v;
+  return o;
 }
 
-// ===== HMAC (amo → X-Signature) =====
-// стало:
+// ---------- HMAC подпись (hex|base64), без require ----------
 async function verifyAmoSignature(rawBody, headerSignature) {
-  if (!SECRET_TOKEN) return { ok: true, reason: 'no_secret' };
-
+  if (!SECRET_TOKEN) return { ok: true, mode: 'no_secret' };
+  const sig = (headerSignature || '').trim();
   try {
     const { createHmac } = await import('node:crypto');
-
     const rawStr = typeof rawBody === 'string' ? rawBody : String(rawBody ?? '');
-    const data =
-      typeof Buffer !== 'undefined'
-        ? Buffer.from(rawStr, 'utf8')
-        : new TextEncoder().encode(rawStr);
+    const data = typeof Buffer !== 'undefined'
+      ? Buffer.from(rawStr, 'utf8')
+      : new TextEncoder().encode(rawStr);
 
-    const hmac = createHmac('sha1', SECRET_TOKEN).update(data);
-    const hex = hmac.digest('hex');
-    // чтобы не пересчитывать второй раз, создадим новый HMAC:
-    const hmac2 = createHmac('sha1', SECRET_TOKEN).update(data);
-    const b64 = hmac2.digest('base64');
+    const h1 = createHmac('sha1', SECRET_TOKEN).update(data).digest('hex');
+    const h2 = createHmac('sha1', SECRET_TOKEN).update(data).digest('base64');
 
-    const sig = (headerSignature || '').trim();
-
-    const match =
-      sig.toLowerCase() === hex.toLowerCase() ||
-      sig === b64; // base64 чувствителен к регистру
-
-    if (!match) {
-      // Диагностика: первые символы, чтобы не светить всё в логах
-      const short = (s) => (s ? s.slice(0, 16) + '…' + s.slice(-8) : '');
-      log('error', 'Invalid HMAC signature', {
-        got_header: short(sig),
-        want_hex: short(hex),
-        want_b64: short(b64),
-      });
+    const ok = sig.toLowerCase() === h1.toLowerCase() || sig === h2;
+    if (!ok) {
+      const short = (s) => (s ? `${s.slice(0, 16)}…${s.slice(-8)}` : '');
+      log('error', 'Invalid HMAC signature', { got: short(sig), want_hex: short(h1), want_b64: short(h2) });
     }
-    return { ok: match, hex, b64 };
+    return { ok, hex: h1, b64: h2 };
   } catch (e) {
-    log('warn', 'Cannot verify HMAC (crypto error):', e?.message || e);
-    return { ok: false, reason: 'crypto_error' };
+    log('warn', 'HMAC crypto error:', e?.message || e);
+    return { ok: false, mode: 'crypto_error' };
   }
 }
 
-// ===== Telegram =====
+// ---------- Telegram ----------
 async function sendTelegram(text) {
   if (!BOT_TOKEN || !CHAT_ID) {
-    log('error', 'TG env missing; BOT_TOKEN/CHAT_ID');
-    return { ok: false, note: 'tg env missing' };
+    log('error', 'TG env missing (BOT_TOKEN/CHAT_ID)');
+    return { ok: false };
   }
   const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
   const resp = await fetch(url, {
@@ -145,26 +122,15 @@ async function sendTelegram(text) {
       disable_web_page_preview: true,
     }),
   });
-  let data = null;
-  try { data = await resp.json(); } catch {}
-  log('info', 'TG RESP:', resp.status, data?.ok === false ? data : 'ok');
+  let data = null; try { data = await resp.json(); } catch {}
+  log('info', 'TG', resp.status, data?.ok === false ? data : 'ok');
   return data || { ok: false };
 }
 
-// ===== amo helpers =====
-function uiSubdomain() {
-  // если дали уже с доменом — аккуратно уберём .amocrm.ru, чтобы не задвоить
-  const s = (AMO_SUBDOMAIN || '').replace(/\.amocrm\.ru$/i, '');
-  return s || (AMO_API_DOMAIN || '').replace(/\.amocrm\.ru$/i, '');
-}
-function leadUrl(leadId) {
-  return `https://${uiSubdomain()}.amocrm.ru/leads/detail/${leadId}`;
-}
-
+// ---------- OAuth refresh & amoFetch ----------
 async function refreshAccessToken() {
-  if (!cachedRefreshToken) throw new Error('No refresh token in env');
-  const domain = AMO_API_DOMAIN || `${uiSubdomain()}.amocrm.ru`;
-  const url = `https://${domain}/oauth2/access_token`;
+  if (!cachedRefreshToken) throw new Error('No refresh token');
+  const url = `https://${domainHost()}/oauth2/access_token`;
   const body = {
     client_id:     AMO_CLIENT_ID,
     client_secret: AMO_CLIENT_SECRET,
@@ -172,47 +138,28 @@ async function refreshAccessToken() {
     refresh_token: cachedRefreshToken,
     redirect_uri:  AMO_REDIRECT_URI,
   };
-  const resp = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
+  const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const json = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    log('error', 'REFRESH FAIL', resp.status, json);
-    throw new Error('refresh_failed');
-  }
-  const newAccess  = json.access_token;
-  const newRefresh = json.refresh_token;
-  if (!newAccess) throw new Error('refresh_missing_access');
-
-  cachedAccessToken = newAccess;
+  if (!resp.ok) { log('error', 'REFRESH FAIL', resp.status, json); throw new Error('refresh_failed'); }
+  cachedAccessToken  = json.access_token || '';
+  const newRefresh   = json.refresh_token;
   if (newRefresh && newRefresh !== cachedRefreshToken) {
-    const mask = (s) => s ? `${s.slice(0, 6)}…${s.slice(-6)}` : '';
+    const mask = (s) => s ? `${s.slice(0,6)}…${s.slice(-6)}` : '';
     log('info', `REFRESH ROTATED → update AMO_REFRESH_TOKEN in Vercel: ${mask(newRefresh)}`);
     cachedRefreshToken = newRefresh;
   }
   log('info', 'TOKEN REFRESHED');
   return cachedAccessToken;
 }
-
 async function amoFetch(path, init = {}, allowRefresh = true) {
-  const domain = AMO_API_DOMAIN || `${uiSubdomain()}.amocrm.ru`;
-  const url = `https://${domain}${path}`;
-
+  const url = `https://${domainHost()}${path}`;
   const doFetch = async (token) => fetch(url, {
     ...init,
-    headers: {
-      ...(init.headers || {}),
-      Authorization: `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json', ...(init.headers || {}), Authorization: `Bearer ${token}` },
   });
 
   let token = cachedAccessToken;
-  if (!token && cachedRefreshToken) {
-    try { token = await refreshAccessToken(); } catch (e) { /* fallthrough */ }
-  }
+  if (!token && cachedRefreshToken) { try { token = await refreshAccessToken(); } catch {} }
   let resp = await doFetch(token || '');
   if (resp.status === 401 && allowRefresh && cachedRefreshToken) {
     await refreshAccessToken();
@@ -221,16 +168,15 @@ async function amoFetch(path, init = {}, allowRefresh = true) {
   return resp;
 }
 
-function pickCfValue(custom_fields_values = [], cfIdStr) {
-  const cfId = Number(cfIdStr);
-  const field = custom_fields_values.find((f) => Number(f.field_id) === cfId);
-  if (!field || !Array.isArray(field.values) || !field.values.length) return '—';
-  const v = field.values[0];
+// ---------- lead utils ----------
+function pickCfValue(custom_fields_values = [], fieldIdStr) {
+  const fid = Number(fieldIdStr);
+  const f = custom_fields_values.find((x) => Number(x.field_id) === fid);
+  if (!f || !Array.isArray(f.values) || !f.values.length) return '—';
+  const v = f.values[0];
   return v.value ?? v.enum ?? '—';
 }
-
 function extractLeadEvent(raw) {
-  // JSON формат: { leads: { status: [ {...} ] } }
   if (raw?.leads?.status) {
     const s = raw.leads.status[0];
     return {
@@ -240,127 +186,85 @@ function extractLeadEvent(raw) {
       old_status_id: String(s?.old_status_id || ''),
     };
   }
-  // form-urlencoded
-  const id           = raw['leads[status][0][id]'];
-  const pipeline_id  = raw['leads[status][0][pipeline_id]'];
-  const status_id    = raw['leads[status][0][status_id]'];
-  const old_status_id= raw['leads[status][0][old_status_id]'];
-  return { id, pipeline_id, status_id, old_status_id };
+  return {
+    id:            raw['leads[status][0][id]'],
+    pipeline_id:   raw['leads[status][0][pipeline_id]'],
+    status_id:     raw['leads[status][0][status_id]'],
+    old_status_id: raw['leads[status][0][old_status_id]'],
+  };
 }
-
 async function buildPrettyMessage(leadId) {
-  // 1) сделка
   const leadResp = await amoFetch(`/api/v4/leads/${leadId}?with=contacts`);
   const leadJson = await leadResp.json().catch(() => ({}));
-  log('info', 'LEAD RESP STATUS:', leadResp.status);
-  if (!leadResp.ok) {
-    log('error', 'LEAD RESP BODY:', leadJson);
-    throw new Error('lead_fetch_failed');
-  }
+  if (!leadResp.ok) { log('error', 'LEAD FAIL', leadResp.status, leadJson); throw new Error('lead_fetch_failed'); }
 
   const name       = leadJson.name || `Сделка #${leadId}`;
   const respUserId = leadJson.responsible_user_id;
   const doorType   = pickCfValue(leadJson.custom_fields_values, FIELD_DOOR_TYPE_ID);
   const city       = pickCfValue(leadJson.custom_fields_values, FIELD_CITY_ID);
 
-  // 2) ответственный
   let manager = '—';
   if (respUserId) {
-    const userResp = await amoFetch(`/api/v4/users/${respUserId}`);
-    const userJson = await userResp.json().catch(() => ({}));
-    log('info', 'USER RESP STATUS:', userResp.status);
-    if (userResp.ok) {
-      manager = userJson.name || userJson.email || String(respUserId);
-    } else {
-      log('error', 'USER RESP BODY:', userJson);
-    }
+    const u = await amoFetch(`/api/v4/users/${respUserId}`);
+    const uj = await u.json().catch(() => ({}));
+    if (u.ok) manager = uj.name || uj.email || String(respUserId);
   }
 
-  const url = leadUrl(leadId);
   return [
     '🚨 Упала новая заявка на производство',
     'Просьба срочно принять в работу.',
     '',
     `Сделка: ${name}`,
-    `Ссылка: ${url}`,
+    `Ссылка: ${leadUrl(leadId)}`,
     `Менеджер: ${manager}`,
     `Тип двери: ${doorType}`,
     `Город доставки: ${city}`,
   ].join('\n');
 }
 
-// ===== Handler =====
+// ---------- handler ----------
 export default async function handler(req, res) {
   try {
-    // health / версия для быстрого контроля деплоя
     if (req.method === 'GET') {
-      return res.status(200).json({
-        ok: true,
-        version: VERSION,
-        domain: AMO_API_DOMAIN || `${uiSubdomain()}.amocrm.ru`,
-      });
+      return res.status(200).json({ ok: true, version: VERSION, domain: domainHost() });
     }
-
     if (req.method !== 'POST') return res.status(405).end();
 
-    // читаем raw тело для HMAC
-    // читаем сырое тело ДО парсинга
-    const ctype = getHeader(req, 'content-type') || '';
+    // 1) читаем сырое тело до любого парсинга
+    const contentType = getHeader(req, 'content-type') || '';
     const rawBody = await readRawBody(req);
 
-    const xSig = getHeader(req, 'x-signature') || getHeader(req, 'X-Signature'); // на всякий
-    const check = await verifyAmoSignature(rawBody, xSig);
+    // 2) HMAC-подпись (hex|base64). Заголовок может быть любым регистром.
+    const headerSig = getHeader(req, 'x-signature') || getHeader(req, 'X-Signature') || '';
+    const sigCheck  = await verifyAmoSignature(rawBody, headerSig);
 
     log('info', 'SIG-CONTEXT', {
-      ctype,
+      ctype: contentType,
       len: rawBody?.length || 0,
-      headSig: xSig ? (xSig.slice(0, 16) + '…') : null,
-      sample: (rawBody || '').slice(0, 200) // первые 200 символов тела
+      headSig: headerSig ? (headerSig.slice(0,16) + '…') : null,
+      sample: (rawBody || '').slice(0, 200),
     });
 
-    if (!check.ok) {
-      // Возвращаем 200, чтобы amo не дёргал ретраи, но помечаем ошибку
+    if (!sigCheck.ok) {
+      // возвращаем 200, чтобы amo не ретраил, но фиксируем проблему
       return res.status(200).json({ ok: false, error: 'invalid_signature' });
     }
 
-    // подпись (если SECRET_TOKEN задан)
-    const xSig = getHeader(req, 'x-signature');
-    if (SECRET_TOKEN) {
-      const ok = await verifyAmoSignature(rawBody, xSig);
-      if (!ok) {
-        log('error', 'Invalid HMAC signature');
-        // 200, чтобы amo не потерял событие, но пометим ошибку
-        return res.status(200).json({ ok: false, error: 'invalid_signature' });
-      }
+    // 3) парсим тело
+    let data;
+    if (contentType.includes('application/json')) {
+      try { data = JSON.parse(rawBody || '{}'); } catch { data = {}; }
     } else {
-      log('warn', 'SECRET_TOKEN is not set → skipping HMAC verification.');
+      data = parseUrlEncoded(rawBody);
     }
+    log('info', 'AMO RAW:', { keys: Object.keys(data).slice(0, 12) });
 
-    // парсим в объект
-    let rawParsed;
-    try {
-      if (ctype.includes('application/json')) {
-        rawParsed = JSON.parse(rawBody || '{}');
-      } else {
-        const params = new URLSearchParams(rawBody || '');
-        const o = Object.create(null);
-        for (const [k, v] of params.entries()) o[k] = v;
-        rawParsed = o;
-      }
-    } catch {
-      rawParsed = {};
-    }
-
-    log('info', 'AMO RAW:', rawParsed);
-
-    const ev = extractLeadEvent(rawParsed);
+    // 4) вынимаем событие
+    const ev = extractLeadEvent(data);
     const leadId = ev.id;
-    if (!leadId) {
-      // ничего критичного — зафиксируем и завершим
-      return res.status(200).json({ ok: true, note: 'no lead id' });
-    }
+    if (!leadId) return res.status(200).json({ ok: true, note: 'no_lead_id' });
 
-    // 1) минималка — чтобы событие не потерять даже если API ляжет
+    // 5) «минималка» — всегда отправляем сразу
     const minimal = [
       '✅ Изменение сделки',
       `Deal #${leadId}`,
@@ -370,18 +274,18 @@ export default async function handler(req, res) {
     ].join('\n');
     await sendTelegram(minimal);
 
-    // 2) «красивое» подробное сообщение
+    // 6) расшифровка и «красивое» сообщение
     try {
-      const text = await buildPrettyMessage(leadId);
-      await sendTelegram(text);
+      const pretty = await buildPrettyMessage(leadId);
+      await sendTelegram(pretty);
       return res.status(200).json({ ok: true });
     } catch (e) {
-      log('error', 'pretty build failed:', e?.message || e);
-      return res.status(200).json({ ok: false, error: 'exception_after_minimal' });
+      log('error', 'pretty fail:', e?.message || e);
+      return res.status(200).json({ ok: false, error: 'pretty_exception' });
     }
   } catch (e) {
-    log('error', 'hook error', e);
-    // Возвращаем 200, чтобы amo не «терял» событие
+    log('error', 'hook error', e?.stack || e);
+    // Возвращаем 200, чтобы amo не терял событие
     return res.status(200).json({ ok: false });
   }
 }
