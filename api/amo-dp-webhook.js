@@ -88,13 +88,20 @@ async function parseBody(req) {
 }
 
 // ===== HMAC (amo → X-Signature) =====
-function verifyAmoSignature(rawBody, headerSignature) {
-  if (!SECRET_TOKEN) return true; // подпись не включена — пропускаем
+// стало:
+async function verifyAmoSignature(rawBody, headerSignature) {
+  if (!SECRET_TOKEN) return true;
   try {
-    const crypto = require('crypto');
-    const digest = crypto.createHmac('sha1', SECRET_TOKEN)
-      .update(Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8'))
-      .digest('hex');
+    const { createHmac } = await import('node:crypto');
+
+    // нормализуем данные
+    const rawStr = typeof rawBody === 'string' ? rawBody : String(rawBody ?? '');
+    const data =
+      typeof Buffer !== 'undefined'
+        ? Buffer.from(rawStr, 'utf8')
+        : new TextEncoder().encode(rawStr);
+
+    const digest = createHmac('sha1', SECRET_TOKEN).update(data).digest('hex');
     return (headerSignature || '').toLowerCase() === digest.toLowerCase();
   } catch (e) {
     log('warn', 'Cannot verify HMAC (crypto error):', e?.message || e);
@@ -283,7 +290,7 @@ export default async function handler(req, res) {
     // подпись (если SECRET_TOKEN задан)
     const xSig = getHeader(req, 'x-signature');
     if (SECRET_TOKEN) {
-      const ok = verifyAmoSignature(rawBody, xSig);
+      const ok = await verifyAmoSignature(rawBody, xSig);
       if (!ok) {
         log('error', 'Invalid HMAC signature');
         // 200, чтобы amo не потерял событие, но пометим ошибку
