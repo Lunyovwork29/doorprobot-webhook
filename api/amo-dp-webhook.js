@@ -254,16 +254,6 @@ export default async function handler(req, res) {
     const leadId = ev.id;
     if (!leadId) return res.status(200).json({ ok: true, note: 'no_lead_id' });
 
-    // 5) быстрый пинг в ТГ (минималка)
-    const minimal = [
-      '✅ Изменение сделки',
-      `Deal #${leadId}`,
-      `Pipeline: ${ev.pipeline_id}`,
-      `Status: ${ev.old_status_id} → ${ev.status_id}`,
-      leadUrl(leadId),
-    ].join('\n');
-    await sendTelegram(minimal);
-
     // 6) подробное сообщение
     try {
       const pretty = await buildPrettyMessage(leadId);
