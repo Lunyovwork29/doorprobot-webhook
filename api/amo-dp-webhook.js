@@ -1,38 +1,108 @@
 // api/amo-dp-webhook.js
-// Vercel Edge/Node function: авто-обновляет access_token, тянет данные сделки и шлёт красиво в Telegram
+// Vercel (Node runtime) — amoCRM Digital Pipeline webhook → Telegram
+// Универсальная работа с заголовками/телом (Node/Edge safe) + автообновление токена + HMAC-подпись
 
+// ===== ENV =====
 const {
+  // amoCRM auth/config
   AMO_CLIENT_ID,
   AMO_CLIENT_SECRET,
   AMO_REDIRECT_URI,
-  AMO_REFRESH_TOKEN: ENV_REFRESH,
-  AMO_ACCESS_TOKEN: ENV_ACCESS, // опционально
-  AMO_SUBDOMAIN,
-  AMO_API_DOMAIN,
-  SECRET_TOKEN,
 
+  AMO_REFRESH_TOKEN: ENV_REFRESH,
+  AMO_ACCESS_TOKEN: ENV_ACCESS, // опционально (ускоряет холодный старт)
+
+  // домены
+  AMO_SUBDOMAIN,                // напр.: "new1754065789" (короткое имя без .amocrm.ru)
+  AMO_API_DOMAIN,               // напр.: "new1754065789.amocrm.ru" (если не задан — соберём из SUBDOMAIN)
+
+  // подпись вебхуков
+  SECRET_TOKEN,                 // лучше использовать тот же secret из интеграции (client_secret)
+
+  // Telegram
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
-
-  // запасные имена, если захочешь оставить TG_*
-  TG_BOT_TOKEN,
+  TG_BOT_TOKEN,                 // запасные имена
   TG_CHAT_ID,
 
+  // кастомные поля сделки (можно переопределить через ENV)
   FIELD_DOOR_TYPE_ID = '2094731',
-  FIELD_CITY_ID = '2094733',
+  FIELD_CITY_ID      = '2094733',
 } = process.env;
 
-// кеш в памяти для «тёплой» функции (Vercel сохраняет в рамках инстанса)
-let cachedAccessToken = ENV_ACCESS || '';
+// ===== RUNTIME STATE (в памяти инстанса) =====
+let cachedAccessToken  = ENV_ACCESS  || '';
 let cachedRefreshToken = ENV_REFRESH || '';
 
 const BOT_TOKEN = TELEGRAM_BOT_TOKEN || TG_BOT_TOKEN;
-const CHAT_ID = TELEGRAM_CHAT_ID || TG_CHAT_ID;
+const CHAT_ID   = TELEGRAM_CHAT_ID   || TG_CHAT_ID;
+
+const VERSION = 'amo-dp-webhook v1.1.0 (node-edge safe + HMAC)';
 
 function log(level, ...args) {
-  console[level](`[amo-dp]`, ...args);
+  // level: 'info' | 'warn' | 'error'
+  console[level]('[amo-dp]', ...args);
 }
 
+// ===== Utilities: headers/raw body (Node/Edge-safe) =====
+function getHeader(req, name) {
+  const n = String(name).toLowerCase();
+  // Edge Request: Headers-like (get)
+  if (req?.headers && typeof req.headers.get === 'function') {
+    return req.headers.get(n) || '';
+  }
+  // Node: plain object
+  if (req?.headers && typeof req.headers === 'object') {
+    return req.headers[n] || '';
+  }
+  return '';
+}
+
+async function readRawBody(req) {
+  // Edge: есть req.text()
+  if (typeof req?.text === 'function') {
+    return await req.text();
+  }
+  // Node: IncomingMessage — собираем чанки
+  return await new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (c) => chunks.push(c));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+async function parseBody(req) {
+  const ctype = getHeader(req, 'content-type') || '';
+  const raw = await readRawBody(req);
+
+  if (ctype.includes('application/json')) {
+    try { return JSON.parse(raw || '{}'); } catch { return {}; }
+  }
+
+  // amo часто шлёт form-urlencoded
+  const params = new URLSearchParams(raw || '');
+  const obj = Object.create(null);
+  for (const [k, v] of params.entries()) obj[k] = v;
+  return obj;
+}
+
+// ===== HMAC (amo → X-Signature) =====
+function verifyAmoSignature(rawBody, headerSignature) {
+  if (!SECRET_TOKEN) return true; // подпись не включена — пропускаем
+  try {
+    const crypto = require('crypto');
+    const digest = crypto.createHmac('sha1', SECRET_TOKEN)
+      .update(Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8'))
+      .digest('hex');
+    return (headerSignature || '').toLowerCase() === digest.toLowerCase();
+  } catch (e) {
+    log('warn', 'Cannot verify HMAC (crypto error):', e?.message || e);
+    return false;
+  }
+}
+
+// ===== Telegram =====
 async function sendTelegram(text) {
   if (!BOT_TOKEN || !CHAT_ID) {
     log('error', 'TG env missing; BOT_TOKEN/CHAT_ID');
@@ -50,71 +120,42 @@ async function sendTelegram(text) {
   });
   let data = null;
   try { data = await resp.json(); } catch {}
-  log('info', 'TG RESP:', resp.status, data);
+  log('info', 'TG RESP:', resp.status, data?.ok === false ? data : 'ok');
   return data || { ok: false };
 }
 
-async function parseBody(req) {
-  const ctype = req.headers.get('content-type') || '';
-  if (ctype.includes('application/json')) {
-    return await req.json(); // digital pipeline может так прислать
-  }
-  // amo чаще шлёт form-urlencoded
-  const text = await req.text();
-  const params = new URLSearchParams(text);
-  const obj = Object.create(null);
-  for (const [k, v] of params.entries()) obj[k] = v;
-  return obj;
+// ===== amo helpers =====
+function uiSubdomain() {
+  // если дали уже с доменом — аккуратно уберём .amocrm.ru, чтобы не задвоить
+  const s = (AMO_SUBDOMAIN || '').replace(/\.amocrm\.ru$/i, '');
+  return s || (AMO_API_DOMAIN || '').replace(/\.amocrm\.ru$/i, '');
 }
-
-function extractLeadEvent(raw) {
-  // поддержка обоих форматов: form и json
-  if (raw?.leads?.status) {
-    // JSON вида { leads: { status: [ {...} ] } }
-    const s = raw.leads.status[0];
-    return {
-      id: String(s?.id || ''),
-      pipeline_id: String(s?.pipeline_id || ''),
-      status_id: String(s?.status_id || ''),
-      old_status_id: String(s?.old_status_id || ''),
-    };
-  }
-  // form-urlencoded
-  const id = raw['leads[status][0][id]'];
-  const pipeline_id = raw['leads[status][0][pipeline_id]'];
-  const status_id = raw['leads[status][0][status_id]'];
-  const old_status_id = raw['leads[status][0][old_status_id]'];
-  return { id, pipeline_id, status_id, old_status_id };
-}
-
 function leadUrl(leadId) {
-  // UI-ссылка всегда на субдомен
-  return `https://${AMO_SUBDOMAIN}.amocrm.ru/leads/detail/${leadId}`;
+  return `https://${uiSubdomain()}.amocrm.ru/leads/detail/${leadId}`;
 }
 
 async function refreshAccessToken() {
   if (!cachedRefreshToken) throw new Error('No refresh token in env');
-  const url = `https://${AMO_SUBDOMAIN}.amocrm.ru/oauth2/access_token`;
+  const domain = AMO_API_DOMAIN || `${uiSubdomain()}.amocrm.ru`;
+  const url = `https://${domain}/oauth2/access_token`;
   const body = {
-    client_id: AMO_CLIENT_ID,
+    client_id:     AMO_CLIENT_ID,
     client_secret: AMO_CLIENT_SECRET,
-    grant_type: 'refresh_token',
+    grant_type:    'refresh_token',
     refresh_token: cachedRefreshToken,
-    redirect_uri: AMO_REDIRECT_URI,
+    redirect_uri:  AMO_REDIRECT_URI,
   };
   const resp = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-
   const json = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     log('error', 'REFRESH FAIL', resp.status, json);
     throw new Error('refresh_failed');
   }
-
-  const newAccess = json.access_token;
+  const newAccess  = json.access_token;
   const newRefresh = json.refresh_token;
   if (!newAccess) throw new Error('refresh_missing_access');
 
@@ -129,10 +170,9 @@ async function refreshAccessToken() {
 }
 
 async function amoFetch(path, init = {}, allowRefresh = true) {
-  if (!AMO_API_DOMAIN) throw new Error('AMO_API_DOMAIN required');
-  const url = `https://${AMO_API_DOMAIN}${path}`;
+  const domain = AMO_API_DOMAIN || `${uiSubdomain()}.amocrm.ru`;
+  const url = `https://${domain}${path}`;
 
-  // всегда пробуем с текущим access; если 401 — рефрешимся и повторяем
   const doFetch = async (token) => fetch(url, {
     ...init,
     headers: {
@@ -159,8 +199,26 @@ function pickCfValue(custom_fields_values = [], cfIdStr) {
   const field = custom_fields_values.find((f) => Number(f.field_id) === cfId);
   if (!field || !Array.isArray(field.values) || !field.values.length) return '—';
   const v = field.values[0];
-  // поддержим простой текст и «элементы списков»
   return v.value ?? v.enum ?? '—';
+}
+
+function extractLeadEvent(raw) {
+  // JSON формат: { leads: { status: [ {...} ] } }
+  if (raw?.leads?.status) {
+    const s = raw.leads.status[0];
+    return {
+      id: String(s?.id || ''),
+      pipeline_id: String(s?.pipeline_id || ''),
+      status_id: String(s?.status_id || ''),
+      old_status_id: String(s?.old_status_id || ''),
+    };
+  }
+  // form-urlencoded
+  const id           = raw['leads[status][0][id]'];
+  const pipeline_id  = raw['leads[status][0][pipeline_id]'];
+  const status_id    = raw['leads[status][0][status_id]'];
+  const old_status_id= raw['leads[status][0][old_status_id]'];
+  return { id, pipeline_id, status_id, old_status_id };
 }
 
 async function buildPrettyMessage(leadId) {
@@ -173,10 +231,10 @@ async function buildPrettyMessage(leadId) {
     throw new Error('lead_fetch_failed');
   }
 
-  const name = leadJson.name || `Сделка #${leadId}`;
+  const name       = leadJson.name || `Сделка #${leadId}`;
   const respUserId = leadJson.responsible_user_id;
-  const doorType = pickCfValue(leadJson.custom_fields_values, FIELD_DOOR_TYPE_ID);
-  const city     = pickCfValue(leadJson.custom_fields_values, FIELD_CITY_ID);
+  const doorType   = pickCfValue(leadJson.custom_fields_values, FIELD_DOOR_TYPE_ID);
+  const city       = pickCfValue(leadJson.custom_fields_values, FIELD_CITY_ID);
 
   // 2) ответственный
   let manager = '—';
@@ -204,20 +262,60 @@ async function buildPrettyMessage(leadId) {
   ].join('\n');
 }
 
+// ===== Handler =====
 export default async function handler(req, res) {
   try {
+    // health / версия для быстрого контроля деплоя
+    if (req.method === 'GET') {
+      return res.status(200).json({
+        ok: true,
+        version: VERSION,
+        domain: AMO_API_DOMAIN || `${uiSubdomain()}.amocrm.ru`,
+      });
+    }
+
     if (req.method !== 'POST') return res.status(405).end();
 
-    // защита по секрету (query ?token=…)
-    const okSecret = !SECRET_TOKEN || (req.query?.token === SECRET_TOKEN);
-    if (!okSecret) return res.status(401).json({ ok: false, error: 'bad token' });
+    // читаем raw тело для HMAC
+    const ctype = getHeader(req, 'content-type') || '';
+    const rawBody = await readRawBody(req);
 
-    const raw = await parseBody(req);
-    log('info', 'AMO RAW:', raw);
+    // подпись (если SECRET_TOKEN задан)
+    const xSig = getHeader(req, 'x-signature');
+    if (SECRET_TOKEN) {
+      const ok = verifyAmoSignature(rawBody, xSig);
+      if (!ok) {
+        log('error', 'Invalid HMAC signature');
+        // 200, чтобы amo не потерял событие, но пометим ошибку
+        return res.status(200).json({ ok: false, error: 'invalid_signature' });
+      }
+    } else {
+      log('warn', 'SECRET_TOKEN is not set → skipping HMAC verification.');
+    }
 
-    const ev = extractLeadEvent(raw);
+    // парсим в объект
+    let rawParsed;
+    try {
+      if (ctype.includes('application/json')) {
+        rawParsed = JSON.parse(rawBody || '{}');
+      } else {
+        const params = new URLSearchParams(rawBody || '');
+        const o = Object.create(null);
+        for (const [k, v] of params.entries()) o[k] = v;
+        rawParsed = o;
+      }
+    } catch {
+      rawParsed = {};
+    }
+
+    log('info', 'AMO RAW:', rawParsed);
+
+    const ev = extractLeadEvent(rawParsed);
     const leadId = ev.id;
-    if (!leadId) return res.status(200).json({ ok: true, note: 'no lead id' });
+    if (!leadId) {
+      // ничего критичного — зафиксируем и завершим
+      return res.status(200).json({ ok: true, note: 'no lead id' });
+    }
 
     // 1) минималка — чтобы событие не потерять даже если API ляжет
     const minimal = [
@@ -229,7 +327,7 @@ export default async function handler(req, res) {
     ].join('\n');
     await sendTelegram(minimal);
 
-    // 2) полноценное сообщение
+    // 2) «красивое» подробное сообщение
     try {
       const text = await buildPrettyMessage(leadId);
       await sendTelegram(text);
